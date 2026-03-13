@@ -4,10 +4,13 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 )
 
-// PublicJWK is a minimal public key representation for clients.
+// PublicJWK is a minimal Ed25519 public key representation.
 type PublicJWK struct {
 	Kty string `json:"kty"`
 	Crv string `json:"crv"`
@@ -17,7 +20,7 @@ type PublicJWK struct {
 	Alg string `json:"alg,omitempty"`
 }
 
-// Signer handles Ed25519 signing for manifests.
+// Signer handles Ed25519 signatures and compact JWS output.
 type Signer struct {
 	keyID string
 	pub   ed25519.PublicKey
@@ -92,4 +95,74 @@ func Verify(publicKeyB64 string, payload []byte, signatureB64 string) bool {
 		return false
 	}
 	return ed25519.Verify(ed25519.PublicKey(pub), payload, sig)
+}
+
+// SignCompactJWS signs payload and returns compact JWS with kid in protected header.
+func (s *Signer) SignCompactJWS(payload []byte) (string, error) {
+	header := map[string]string{"alg": "EdDSA", "kid": s.keyID, "typ": "JWT"}
+	hb, err := json.Marshal(header)
+	if err != nil {
+		return "", err
+	}
+	headEnc := base64.RawURLEncoding.EncodeToString(hb)
+	payloadEnc := base64.RawURLEncoding.EncodeToString(payload)
+	signingInput := headEnc + "." + payloadEnc
+	sig := ed25519.Sign(s.priv, []byte(signingInput))
+	sigEnc := base64.RawURLEncoding.EncodeToString(sig)
+	return signingInput + "." + sigEnc, nil
+}
+
+// VerifyCompactJWS verifies compact JWS using a JWKS key set and returns payload and kid.
+func VerifyCompactJWS(jws string, keys []PublicJWK) ([]byte, string, error) {
+	parts := strings.Split(jws, ".")
+	if len(parts) != 3 {
+		return nil, "", errors.New("invalid jws format")
+	}
+
+	headerJSON, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid jws header: %w", err)
+	}
+	var header struct {
+		Alg string `json:"alg"`
+		Kid string `json:"kid"`
+	}
+	if err := json.Unmarshal(headerJSON, &header); err != nil {
+		return nil, "", fmt.Errorf("invalid jws header json: %w", err)
+	}
+	if header.Alg != "EdDSA" {
+		return nil, "", errors.New("unsupported jws alg")
+	}
+	if header.Kid == "" {
+		return nil, "", errors.New("missing kid")
+	}
+
+	var key *PublicJWK
+	for i := range keys {
+		if keys[i].Kid == header.Kid {
+			key = &keys[i]
+			break
+		}
+	}
+	if key == nil {
+		return nil, "", errors.New("unknown kid")
+	}
+
+	pub, err := base64.RawURLEncoding.DecodeString(key.X)
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid jwk x: %w", err)
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid jws signature: %w", err)
+	}
+	if !ed25519.Verify(ed25519.PublicKey(pub), []byte(parts[0]+"."+parts[1]), sig) {
+		return nil, "", errors.New("signature verification failed")
+	}
+
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid jws payload: %w", err)
+	}
+	return payload, header.Kid, nil
 }

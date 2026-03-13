@@ -20,7 +20,9 @@ export class SyncAgent {
 
     await this.opQueue.markStatus(queued, "syncing");
 
+    const traceID = crypto.randomUUID();
     const payload = {
+      client_tx_id: crypto.randomUUID(),
       client_id: clientID,
       ops: queued.map((q) => q.op),
     };
@@ -32,6 +34,7 @@ export class SyncAgent {
         headers: {
           Authorization: `Bearer ${this.token}`,
           "Content-Type": "application/json",
+          "X-Trace-Id": traceID,
         },
         body: JSON.stringify(payload),
       });
@@ -88,6 +91,7 @@ export class SyncAgent {
     await addAudit("sync.completed", {
       acked: acked.length,
       conflicts: conflicts.length,
+      tx_id: syncResponse.tx_id,
     });
 
     return {

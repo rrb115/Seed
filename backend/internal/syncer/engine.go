@@ -1,22 +1,40 @@
 package syncer
 
 import (
-	"fmt"
+	"context"
+	"encoding/json"
+	"errors"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"seed/backend/internal/core"
 	"seed/backend/internal/store"
 )
 
-// Engine applies offline ops with idempotence and simple conflict handling.
-type Engine struct {
-	store     *store.MemoryStore
-	inventory map[string]int64
+// PrepareTokenValidator validates workflow prepare tokens during sync.
+type PrepareTokenValidator interface {
+	ValidatePrepareToken(ctx context.Context, workflowID string, token string) error
 }
 
-func NewEngine(st *store.MemoryStore) *Engine {
+// Engine applies operations with idempotence and conflict handling.
+type Engine struct {
+	store              store.Store
+	inventory          map[string]int64
+	conflicts          *Registry
+	objectClassHandler map[string]string
+	requirePrepare     map[string]bool
+	prepareValidator   PrepareTokenValidator
+}
+
+type stateEntry struct {
+	stateRaw json.RawMessage
+	stateMap map[string]any
+	lastSeq  int64
+}
+
+func NewEngine(st store.Store) *Engine {
 	return &Engine{
 		store: st,
 		inventory: map[string]int64{
@@ -24,275 +42,375 @@ func NewEngine(st *store.MemoryStore) *Engine {
 			"sku-2": 0,
 			"sku-3": 100,
 		},
+		conflicts: NewRegistry(),
+		objectClassHandler: map[string]string{
+			"note":   "lww",
+			"ticket": "reject",
+			"cart":   "transform",
+		},
+		requirePrepare: map[string]bool{},
 	}
 }
 
-func (e *Engine) Apply(req core.SyncRequest) core.SyncResponse {
-	acked := make([]string, 0, len(req.Ops))
-	conflicts := make([]core.Conflict, 0)
-	touched := map[string]struct{}{}
+func (e *Engine) SetPrepareValidator(v PrepareTokenValidator) {
+	e.prepareValidator = v
+}
 
-	for _, op := range req.Ops {
-		if op.OpID == "" || op.ObjectID == "" || op.ClientID == "" {
+func (e *Engine) SetPrepareRequirements(workflows map[string]bool) {
+	cp := make(map[string]bool, len(workflows))
+	for k, v := range workflows {
+		cp[k] = v
+	}
+	e.requirePrepare = cp
+}
+
+func (e *Engine) SetObjectClassHandlers(handlers map[string]string) {
+	cp := make(map[string]string, len(handlers))
+	for k, v := range handlers {
+		cp[k] = v
+	}
+	e.objectClassHandler = cp
+}
+
+func (e *Engine) Apply(ctx context.Context, req core.SyncRequest, txID uuid.UUID) core.SyncResponse {
+	if txID == uuid.Nil {
+		txID = uuid.New()
+	}
+
+	resp := core.SyncResponse{
+		TxID:       txID.String(),
+		ServerTime: time.Now().UTC(),
+		Status:     "completed",
+	}
+	if len(req.Ops) == 0 {
+		resp.Conflicts = []core.Conflict{{Reason: "ops_empty", Handler: "reject"}}
+		return resp
+	}
+
+	states := map[string]*stateEntry{}
+	touched := map[string]struct{}{}
+	acked := make([]string, 0, len(req.Ops))
+	toApply := make([]core.Operation, 0, len(req.Ops))
+	conflicts := make([]core.Conflict, 0)
+
+	for _, rawOp := range req.Ops {
+		op := normalizeOperation(rawOp)
+		if err := validateBaseOperation(op); err != nil {
 			conflicts = append(conflicts, core.Conflict{
-				ObjectID:  op.ObjectID,
-				OpID:      op.OpID,
-				Reason:    "invalid_op",
-				Suggested: "drop",
-				Metadata: map[string]any{
-					"detail": "op_id, object_id, and client_id are required",
+				ObjectID: op.ObjectID,
+				OpID:     op.OpID,
+				Reason:   "invalid_op",
+				Handler:  "reject",
+				SuggestedFix: map[string]any{
+					"error": err.Error(),
 				},
 			})
 			continue
 		}
 
-		if e.store.IsAcked(op.OpID) {
+		dup, err := e.isDuplicate(ctx, op)
+		if err != nil {
+			conflicts = append(conflicts, core.Conflict{ObjectID: op.ObjectID, OpID: op.OpID, Reason: "store_error", Handler: "reject", SuggestedFix: map[string]any{"error": err.Error()}})
+			continue
+		}
+		if dup {
 			acked = append(acked, op.OpID)
 			touched[op.ObjectID] = struct{}{}
 			continue
 		}
 
-		object := e.store.GetObject(op.ObjectID)
-		seq := effectiveSequence(op)
-		if seq == 0 {
-			conflicts = append(conflicts, core.Conflict{
-				ObjectID:  op.ObjectID,
-				OpID:      op.OpID,
-				Reason:    "invalid_sequence",
-				Suggested: "drop",
-				Metadata:  map[string]any{"detail": "sequence_number (or clock) must be > 0"},
-			})
-			continue
-		}
-		if seq <= object.LastAppliedSequence {
-			conflicts = append(conflicts, core.Conflict{
-				ObjectID:  op.ObjectID,
-				OpID:      op.OpID,
-				Reason:    "out_of_order_sequence",
-				Suggested: "drop",
-				Metadata: map[string]any{
-					"sequence_number":       seq,
-					"last_applied_sequence": object.LastAppliedSequence,
-				},
-			})
+		entry, err := e.loadState(ctx, states, op.ObjectID)
+		if err != nil {
+			conflicts = append(conflicts, core.Conflict{ObjectID: op.ObjectID, OpID: op.OpID, Reason: "store_error", Handler: "reject", SuggestedFix: map[string]any{"error": err.Error()}})
 			continue
 		}
 
-		applied, conflict := e.applyOne(&object, op)
-		if conflict != nil {
+		handler := e.resolveHandler(op.ObjectID)
+
+		if op.Sequence <= entry.lastSeq {
+			decision, details := handler.HandleConflict(ctx, op, entry.stateRaw)
+			if !decision.Apply {
+				conflicts = append(conflicts, core.Conflict{ObjectID: op.ObjectID, OpID: op.OpID, Reason: "out_of_order_sequence", Handler: decision.Name, SuggestedFix: details})
+				continue
+			}
+			op.Sequence = entry.lastSeq + 1
+		}
+
+		if e.requirePrepare[op.Workflow] {
+			if err := e.validatePrepare(ctx, op); err != nil {
+				decision, details := handler.HandleConflict(ctx, op, entry.stateRaw)
+				details["error"] = err.Error()
+				conflicts = append(conflicts, core.Conflict{ObjectID: op.ObjectID, OpID: op.OpID, Reason: "prepare_token_invalid", Handler: decision.Name, SuggestedFix: details})
+				continue
+			}
+		}
+
+		if conflict := validateWorkflowOperation(op); conflict != nil {
+			decision, details := handler.HandleConflict(ctx, op, entry.stateRaw)
+			if conflict.SuggestedFix == nil {
+				conflict.SuggestedFix = map[string]any{}
+			}
+			for k, v := range details {
+				conflict.SuggestedFix[k] = v
+			}
+			conflict.Handler = decision.Name
 			conflicts = append(conflicts, *conflict)
 			continue
 		}
-		if applied {
-			if op.Clock > object.VersionVector[op.ClientID] {
-				object.VersionVector[op.ClientID] = op.Clock
+
+		if conflict := e.ensureInventory(op); conflict != nil {
+			decision, details := handler.HandleConflict(ctx, op, entry.stateRaw)
+			if conflict.SuggestedFix == nil {
+				conflict.SuggestedFix = map[string]any{}
 			}
-			object.LastAppliedSequence = seq
-			e.store.PutObject(op.ObjectID, object)
-			e.store.MarkAcked(op.OpID)
-			acked = append(acked, op.OpID)
-			touched[op.ObjectID] = struct{}{}
-		}
-	}
-
-	sort.Strings(acked)
-	results := make([]core.ObjectResult, 0, len(touched))
-	for objectID := range touched {
-		obj := e.store.GetObject(objectID)
-		results = append(results, core.ObjectResult{
-			ObjectID:            objectID,
-			State:               obj.Data,
-			VersionVector:       obj.VersionVector,
-			LastAppliedSequence: obj.LastAppliedSequence,
-		})
-	}
-	sort.Slice(results, func(i, j int) bool { return results[i].ObjectID < results[j].ObjectID })
-
-	return core.SyncResponse{
-		ServerTime: time.Now().UTC(),
-		AckedOpIDs: acked,
-		Results:    results,
-		Conflicts:  conflicts,
-		Status:     "completed",
-	}
-}
-
-func effectiveSequence(op core.Op) uint64 {
-	if op.SequenceNumber > 0 {
-		return op.SequenceNumber
-	}
-	return op.Clock
-}
-
-func (e *Engine) applyOne(object *store.ObjectState, op core.Op) (bool, *core.Conflict) {
-	if conflict := validateWorkflowOperation(op); conflict != nil {
-		return false, conflict
-	}
-
-	switch op.Type {
-	case "set_field":
-		if len(op.Path) == 0 {
-			return false, &core.Conflict{
-				ObjectID:  op.ObjectID,
-				OpID:      op.OpID,
-				Reason:    "invalid_path",
-				Suggested: "drop",
+			for k, v := range details {
+				conflict.SuggestedFix[k] = v
 			}
+			conflict.Handler = decision.Name
+			conflicts = append(conflicts, *conflict)
+			continue
 		}
-		setNestedField(object.Data, op.Path, op.Value)
-		return true, nil
-	case "add_item":
-		sku, qty, ok := decodeItem(op.Value)
-		if !ok {
-			return false, invalidValueConflict(op)
+
+		if err := core.ApplyOperationState(entry.stateMap, op); err != nil {
+			conflicts = append(conflicts, core.Conflict{ObjectID: op.ObjectID, OpID: op.OpID, Reason: "projection_failed", Handler: "reject", SuggestedFix: map[string]any{"error": err.Error()}})
+			continue
 		}
-		if conflict := e.ensureInventory(op, sku, qty); conflict != nil {
-			return false, conflict
-		}
-		items := ensureItemsMap(object.Data)
-		items[sku] += qty
-		return true, nil
-	case "remove_item":
-		sku := ""
-		if v, ok := op.Value.(string); ok {
-			sku = strings.TrimSpace(v)
-		}
-		if sku == "" {
-			return false, invalidValueConflict(op)
-		}
-		items := ensureItemsMap(object.Data)
-		delete(items, sku)
-		return true, nil
-	case "set_quantity":
-		sku, qty, ok := decodeItem(op.Value)
-		if !ok {
-			return false, invalidValueConflict(op)
-		}
-		if conflict := e.ensureInventory(op, sku, qty); conflict != nil {
-			return false, conflict
-		}
-		items := ensureItemsMap(object.Data)
-		items[sku] = qty
-		return true, nil
-	default:
-		return false, &core.Conflict{
-			ObjectID:  op.ObjectID,
-			OpID:      op.OpID,
-			Reason:    "unsupported_op",
-			Suggested: "client_upgrade",
-			Metadata:  map[string]any{"op_type": op.Type},
-		}
+		entry.lastSeq = op.Sequence
+		entry.stateMap["_meta"] = map[string]any{"updated_at": time.Now().UTC().Format(time.RFC3339Nano)}
+		entry.stateRaw, _ = json.Marshal(entry.stateMap)
+
+		toApply = append(toApply, op)
+		touched[op.ObjectID] = struct{}{}
 	}
+
+	if len(conflicts) > 0 {
+		resp.Conflicts = conflicts
+		resp.AckedOpIDs = sortedUnique(acked)
+		resp.Results = e.resultsForObjects(ctx, touched)
+		return resp
+	}
+
+	if len(toApply) == 0 {
+		resp.AckedOpIDs = sortedUnique(acked)
+		resp.Results = e.resultsForObjects(ctx, touched)
+		return resp
+	}
+
+	eventIDs, err := e.store.AppendEventsTx(ctx, txID, toApply)
+	if err != nil {
+		if errors.Is(err, store.ErrOpSeen) {
+			for _, op := range toApply {
+				acked = append(acked, op.OpID)
+			}
+			resp.AckedOpIDs = sortedUnique(acked)
+			resp.Results = e.resultsForObjects(ctx, touched)
+			return resp
+		}
+		resp.Conflicts = []core.Conflict{{Reason: "append_failed", Handler: "reject", SuggestedFix: map[string]any{"error": err.Error()}}}
+		return resp
+	}
+
+	applied := make([]string, 0, len(eventIDs))
+	for _, id := range eventIDs {
+		applied = append(applied, id.String())
+	}
+	for _, op := range toApply {
+		acked = append(acked, op.OpID)
+	}
+
+	resp.AppliedEvents = applied
+	resp.AckedOpIDs = sortedUnique(acked)
+	resp.Results = e.resultsForObjects(ctx, touched)
+	return resp
 }
 
-func validateWorkflowOperation(op core.Op) *core.Conflict {
+func normalizeOperation(op core.Operation) core.Operation {
+	if op.Sequence == 0 && op.Sequence <= 0 {
+		op.Sequence = int64(op.Clock)
+	}
+	if op.Timestamp.IsZero() {
+		op.Timestamp = time.Now().UTC()
+	}
+	if op.Payload == nil || len(op.Payload) == 0 {
+		payload, err := core.CanonicalOperationPayload(op)
+		if err == nil {
+			op.Payload = payload
+		}
+	}
+	return op
+}
+
+func validateBaseOperation(op core.Operation) error {
+	if strings.TrimSpace(op.OpID) == "" {
+		return errors.New("op_id is required")
+	}
+	if strings.TrimSpace(op.ObjectID) == "" {
+		return errors.New("object_id is required")
+	}
+	if op.Sequence <= 0 {
+		return errors.New("sequence_number must be > 0")
+	}
+	_, _, _, err := core.DecodeOperationPayload(op)
+	return err
+}
+
+func (e *Engine) loadState(ctx context.Context, cache map[string]*stateEntry, objectID string) (*stateEntry, error) {
+	if got, ok := cache[objectID]; ok {
+		return got, nil
+	}
+	stateRaw, lastSeq, err := e.store.GetObjectState(ctx, objectID)
+	if err != nil {
+		return nil, err
+	}
+	if len(stateRaw) == 0 {
+		stateRaw = json.RawMessage("{}")
+	}
+	stateMap := map[string]any{}
+	if err := json.Unmarshal(stateRaw, &stateMap); err != nil {
+		stateMap = map[string]any{}
+	}
+	entry := &stateEntry{stateRaw: stateRaw, stateMap: stateMap, lastSeq: lastSeq}
+	cache[objectID] = entry
+	return entry, nil
+}
+
+func (e *Engine) validatePrepare(ctx context.Context, op core.Operation) error {
+	if strings.TrimSpace(op.PrepareToken) == "" {
+		return errors.New("prepare_token missing")
+	}
+	if e.prepareValidator == nil {
+		return errors.New("prepare validator not configured")
+	}
+	return e.prepareValidator.ValidatePrepareToken(ctx, op.Workflow, op.PrepareToken)
+}
+
+func (e *Engine) isDuplicate(ctx context.Context, op core.Operation) (bool, error) {
+	events, err := e.store.ListEvents(ctx, op.ObjectID, time.Time{})
+	if err != nil {
+		return false, err
+	}
+	for _, evt := range events {
+		if evt.OpID == op.OpID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (e *Engine) resolveHandler(objectID string) ConflictHandler {
+	class := objectID
+	if i := strings.Index(class, ":"); i > 0 {
+		class = class[:i]
+	}
+	name := e.objectClassHandler[class]
+	if name == "" {
+		name = "reject"
+	}
+	return e.conflicts.Resolve(name)
+}
+
+func validateWorkflowOperation(op core.Operation) *core.Conflict {
+	typeName, path, value, err := core.DecodeOperationPayload(op)
+	if err != nil {
+		return &core.Conflict{ObjectID: op.ObjectID, OpID: op.OpID, Reason: "invalid_payload", SuggestedFix: map[string]any{"error": err.Error()}}
+	}
+
 	switch op.Workflow {
 	case "support_ticket", "signup":
-		if op.Type != "set_field" {
+		if typeName != "set_field" {
 			return nil
 		}
-		if len(op.Path) == 0 {
-			return &core.Conflict{
-				ObjectID:  op.ObjectID,
-				OpID:      op.OpID,
-				Reason:    "validation_failed",
-				Suggested: "edit_and_resubmit",
-				Metadata:  map[string]any{"detail": "path is required for validated field update"},
-			}
+		if len(path) == 0 {
+			return &core.Conflict{ObjectID: op.ObjectID, OpID: op.OpID, Reason: "validation_failed", SuggestedFix: map[string]any{"detail": "path is required"}}
 		}
-
-		field := strings.ToLower(op.Path[len(op.Path)-1])
+		field := strings.ToLower(path[len(path)-1])
 		if field == "email" {
-			email, ok := op.Value.(string)
+			email, ok := value.(string)
 			if !ok || !strings.Contains(email, "@") {
-				return &core.Conflict{
-					ObjectID:  op.ObjectID,
-					OpID:      op.OpID,
-					Reason:    "validation_failed",
-					Suggested: "edit_and_resubmit",
-					Metadata:  map[string]any{"field": "email", "detail": "invalid email format"},
-				}
+				return &core.Conflict{ObjectID: op.ObjectID, OpID: op.OpID, Reason: "validation_failed", SuggestedFix: map[string]any{"field": "email", "detail": "invalid email format"}}
 			}
 		}
-
 		if field == "message" || field == "bio" {
-			msg, ok := op.Value.(string)
+			msg, ok := value.(string)
 			if !ok || len(strings.TrimSpace(msg)) < 5 {
-				return &core.Conflict{
-					ObjectID:  op.ObjectID,
-					OpID:      op.OpID,
-					Reason:    "validation_failed",
-					Suggested: "edit_and_resubmit",
-					Metadata:  map[string]any{"field": field, "detail": "value is too short"},
-				}
+				return &core.Conflict{ObjectID: op.ObjectID, OpID: op.OpID, Reason: "validation_failed", SuggestedFix: map[string]any{"field": field, "detail": "value is too short"}}
 			}
 		}
 	}
-
 	return nil
 }
 
-func invalidValueConflict(op core.Op) *core.Conflict {
-	return &core.Conflict{
-		ObjectID:  op.ObjectID,
-		OpID:      op.OpID,
-		Reason:    "invalid_value",
-		Suggested: "drop",
+func (e *Engine) ensureInventory(op core.Operation) *core.Conflict {
+	typ, _, value, err := core.DecodeOperationPayload(op)
+	if err != nil {
+		return &core.Conflict{ObjectID: op.ObjectID, OpID: op.OpID, Reason: "invalid_payload", SuggestedFix: map[string]any{"error": err.Error()}}
 	}
-}
-
-func (e *Engine) ensureInventory(op core.Op, sku string, qty int64) *core.Conflict {
+	if typ != "add_item" && typ != "set_quantity" {
+		return nil
+	}
+	m, ok := value.(map[string]any)
+	if !ok {
+		return &core.Conflict{ObjectID: op.ObjectID, OpID: op.OpID, Reason: "invalid_value", SuggestedFix: map[string]any{"detail": "sku/qty expected"}}
+	}
+	sku, ok := m["sku"].(string)
+	if !ok || sku == "" {
+		return &core.Conflict{ObjectID: op.ObjectID, OpID: op.OpID, Reason: "invalid_value", SuggestedFix: map[string]any{"detail": "sku missing"}}
+	}
+	qty, ok := asInt64(m["qty"])
+	if !ok {
+		return &core.Conflict{ObjectID: op.ObjectID, OpID: op.OpID, Reason: "invalid_value", SuggestedFix: map[string]any{"detail": "qty missing"}}
+	}
 	available := e.inventory[sku]
 	if qty <= available {
 		return nil
 	}
 	return &core.Conflict{
-		ObjectID:  op.ObjectID,
-		OpID:      op.OpID,
-		Reason:    "inventory_zero",
-		Suggested: "partial_fulfill",
-		Metadata: map[string]any{
-			"sku":              sku,
-			"requested_qty":    qty,
-			"available_qty":    available,
-			"alternate_sku":    "sku-3",
-			"alternate_reason": "fallback_item_available",
+		ObjectID: op.ObjectID,
+		OpID:     op.OpID,
+		Reason:   "inventory_zero",
+		SuggestedFix: map[string]any{
+			"sku":           sku,
+			"requested_qty": qty,
+			"available_qty": available,
+			"alternate_sku": "sku-3",
 		},
 	}
 }
 
-func setNestedField(root map[string]any, path []string, value any) {
-	cur := root
-	for i := 0; i < len(path)-1; i++ {
-		key := path[i]
-		next, ok := cur[key].(map[string]any)
-		if !ok {
-			next = map[string]any{}
-			cur[key] = next
+func (e *Engine) resultsForObjects(ctx context.Context, touched map[string]struct{}) []core.ObjectResult {
+	results := make([]core.ObjectResult, 0, len(touched))
+	for objectID := range touched {
+		stateRaw, lastSeq, err := e.store.GetObjectState(ctx, objectID)
+		if err != nil {
+			continue
 		}
-		cur = next
+		state := map[string]any{}
+		_ = json.Unmarshal(stateRaw, &state)
+		results = append(results, core.ObjectResult{
+			ObjectID:            objectID,
+			State:               state,
+			LastAppliedSequence: lastSeq,
+		})
 	}
-	cur[path[len(path)-1]] = value
+	sort.Slice(results, func(i, j int) bool { return results[i].ObjectID < results[j].ObjectID })
+	return results
 }
 
-func decodeItem(v any) (string, int64, bool) {
-	mv, ok := v.(map[string]any)
-	if !ok {
-		return "", 0, false
+func sortedUnique(values []string) []string {
+	if len(values) == 0 {
+		return values
 	}
-	skuVal, ok := mv["sku"].(string)
-	if !ok || strings.TrimSpace(skuVal) == "" {
-		return "", 0, false
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
 	}
-	qtyRaw, ok := mv["qty"]
-	if !ok {
-		return "", 0, false
-	}
-	qty, ok := asInt64(qtyRaw)
-	if !ok || qty < 0 {
-		return "", 0, false
-	}
-	return skuVal, qty, true
+	sort.Strings(out)
+	return out
 }
 
 func asInt64(v any) (int64, bool) {
@@ -302,32 +420,12 @@ func asInt64(v any) (int64, bool) {
 	case int64:
 		return tv, true
 	case float64:
-		return int64(tv), float64(int64(tv)) == tv
+		return int64(tv), true
+	case float32:
+		return int64(tv), true
+	case uint64:
+		return int64(tv), true
 	default:
 		return 0, false
 	}
-}
-
-func ensureItemsMap(data map[string]any) map[string]int64 {
-	raw, ok := data["items"]
-	if !ok {
-		m := map[string]int64{}
-		data["items"] = m
-		return m
-	}
-	if typed, ok := raw.(map[string]int64); ok {
-		return typed
-	}
-	if anyMap, ok := raw.(map[string]any); ok {
-		converted := map[string]int64{}
-		for k, v := range anyMap {
-			qty, ok := asInt64(v)
-			if ok {
-				converted[k] = qty
-			}
-		}
-		data["items"] = converted
-		return converted
-	}
-	panic(fmt.Sprintf("items field has unsupported type %T", raw))
 }

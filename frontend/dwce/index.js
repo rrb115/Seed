@@ -23,6 +23,7 @@ class DWCERuntime {
     this.manifestManager = null;
     this.syncAgent = null;
     this.lastPreparedWorkflow = null;
+    this.workflowPrepareTokens = new Map();
   }
 
   async init(options = {}) {
@@ -111,6 +112,9 @@ class DWCERuntime {
     const closure = this.dependencyGraph.computeMinimalClosure(goal, steps);
 
     const manifest = await this.manifestManager.prepareWorkflowManifest(goal, steps, closure);
+    if (manifest.prepare_token) {
+      this.workflowPrepareTokens.set(goal, manifest.prepare_token);
+    }
     this.lastPreparedWorkflow = goal;
     this.#emit("workflow.prepared", {
       goal,
@@ -132,7 +136,8 @@ class DWCERuntime {
 
     const safetyClass = this.workflowEngine.evaluateSafety(workflow);
     const offline = !navigator.onLine;
-    const op = this.#normalizeOp({ ...opInput, workflow });
+    const prepareToken = opInput?.prepare_token || this.workflowPrepareTokens.get(workflow);
+    const op = this.#normalizeOp({ ...opInput, workflow, prepare_token: prepareToken });
 
     if (safetyClass === "UNSAFE" && offline) {
       await this.opQueue.enqueue(op, { status: "intent", lifecycle: "Draft" });
@@ -185,6 +190,7 @@ class DWCERuntime {
       object_id: opInput.object_id,
       client_id: this.clientID,
       workflow: opInput.workflow,
+      prepare_token: opInput.prepare_token,
       clock,
       type: opInput.type,
       path: opInput.path,

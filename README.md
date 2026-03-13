@@ -1,43 +1,42 @@
-# Seed Implementation Guide
+# Seed
 
-## What Seed is
+Seed is an offline workflow runtime reference.
 
-Seed is an implementation for workflow cache, local operation queue, and sync APIs.
+## What Seed includes
 
-Seed has two parts:
+- backend APIs for manifests, prepare tokens, sync, status, metrics, and key distribution
+- sync engine with validation, conflict handling, and batch apply semantics
+- in-memory store adapter and store interface for pluggable persistence
+- adapter templates for Postgres and event-store style backends
+- demo frontend runtime and service worker for backend integration tests
 
-- `backend/`: Go server for manifest, sync, and key endpoints.
-- `frontend/`: client used to call APIs and test workflow flows.
+## Repository structure
 
-Seed is the implementation name in this repo.
+- `backend/` Go services, engine, store interface, admin CLI, tests
+- `frontend/` demo client and service worker
+- `docs/` architecture, design, security, migration, and integration docs
 
-## How Seed works
+Detailed map: [docs/code_map.md](docs/code_map.md)
 
-1. Client calls `GET /v1/manifest?goal=<workflow>`.
-2. Server returns a signed manifest with workflow steps and resources.
-3. Client stores resources and records user operations in local storage.
-4. Client sends batched operations to `POST /v1/sync`.
-5. Server validates and applies operations.
-6. Client reads result from sync response or `GET /v1/sync/status` when async mode is used.
+## Core entry points
 
-## Code map
+- backend server: [`backend/cmd/server/main.go`](backend/cmd/server/main.go)
+- admin CLI: [`backend/cmd/admin/main.go`](backend/cmd/admin/main.go)
+- API handlers: [`backend/internal/api/server.go`](backend/internal/api/server.go)
+- sync engine: [`backend/internal/syncer/engine.go`](backend/internal/syncer/engine.go)
+- store interface: [`backend/internal/store/store.go`](backend/internal/store/store.go)
+- memory adapter: [`backend/internal/store/memory.go`](backend/internal/store/memory.go)
+- signer and JWKS/JWS helpers: [`backend/internal/security/signer.go`](backend/internal/security/signer.go)
 
-- Server entry: `backend/cmd/server/main.go`
-- API routes and workflow maps: `backend/internal/api/server.go`
-- Data models: `backend/internal/core/types.go`
-- Manifest signing: `backend/internal/security/signer.go`
-- Sync rules and apply logic: `backend/internal/syncer/engine.go`
-- In-memory store: `backend/internal/store/memory.go`
-- Client runtime modules: `frontend/dwce/*.js`
-- Service worker: `frontend/sw.js`
-
-## API list
+## API endpoints
 
 - `GET /.well-known/dwce-keys`
 - `GET /v1/manifest`
+- `POST /v1/prepare?workflow_id=<id>`
 - `POST /v1/sync`
-- `GET /v1/sync/status`
+- `GET /v1/sync/status?queue_id=<id>`
 - `POST /v1/verify-resource`
+- `GET /metrics`
 
 ## Run
 
@@ -55,60 +54,45 @@ cd backend
 go test ./...
 ```
 
-## What to change for your web app
+## Admin CLI
 
-1. Workflow IDs, steps, and resource paths
-- File: `backend/internal/api/server.go`
-- Update `manifestTemplates()` and `workflowGraphs()`.
+```bash
+cd backend
+go run ./cmd/admin events --object note:1 --from 2026-03-13T00:00:00Z --to 2026-03-13T23:59:59Z
+go run ./cmd/admin replay --object note:1 --from 2026-03-13T00:00:00Z --to 2026-03-13T23:59:59Z
+```
 
-2. Auth check
-- File: `backend/internal/api/server.go`
-- Replace token compare in `withAuth()` with your auth check.
+## Store adapters
 
-3. Signing key source
-- File: `backend/internal/security/signer.go`
-- Keep Ed25519 output and `kid` values.
-- Replace seed source if your key source is different.
+- memory reference adapter: [`backend/internal/store/memory.go`](backend/internal/store/memory.go)
+- Postgres template: [`backend/internal/store/adapters/postgres_template.go`](backend/internal/store/adapters/postgres_template.go)
+- event-store template: [`backend/internal/store/adapters/eventstore_template.go`](backend/internal/store/adapters/eventstore_template.go)
 
-4. Sync rule set
-- File: `backend/internal/syncer/engine.go`
-- Update `validateWorkflowOperation()` with your rule set.
-- Keep op-id dedupe and sequence checks.
+Adapter contract: [docs/store_contract.md](docs/store_contract.md)
 
-5. Storage layer
-- File: `backend/internal/store/memory.go`
-- Current implementation uses in-memory maps.
-- Keep map store or replace with your store.
-- Keep behavior for:
-  - op dedupe lookup
-  - object read/write
-  - sync status read/write
-  - last applied sequence tracking
+## Integration steps for external apps
 
-## Client integration steps for another app
+1. Define workflow templates and resource closure maps in backend: [`backend/internal/api/server.go`](backend/internal/api/server.go).
+2. Map user actions to operations with `op_id`, `object_id`, `sequence_number`, and `payload`.
+3. Keep workflow validation and conflict mapping in backend engine: [`backend/internal/syncer/engine.go`](backend/internal/syncer/engine.go).
+4. Verify manifest JWS with JWKS before caching resources.
+5. Keep local outbox semantics in client: write, commit, then sync.
+6. Replace memory adapter with your own adapter using templates and the store contract.
 
-1. Build local queue
-- Store operations in browser storage.
-- Increment `sequence_number` per `object_id`.
+## Docs index
 
-2. Fetch and verify manifest
-- Call `GET /v1/manifest?goal=<workflow>`.
-- Fetch keys from `GET /.well-known/dwce-keys`.
-- Verify signature before caching resources.
+- docs index: [docs/README.md](docs/README.md)
+- architecture: [docs/architecture.md](docs/architecture.md)
+- design: [docs/design.md](docs/design.md)
+- security: [docs/security.md](docs/security.md)
+- client integration: [docs/client.md](docs/client.md)
+- migration: [docs/migration.md](docs/migration.md)
+- store contract: [docs/store_contract.md](docs/store_contract.md)
+- code map: [docs/code_map.md](docs/code_map.md)
 
-3. Record operations
-- Map each user action to one operation payload.
-- Save operation before showing saved state.
+## References
 
-4. Sync
-- Send batches to `POST /v1/sync`.
-- If response is `202`, poll `GET /v1/sync/status?queue_id=<id>`.
-
-5. Apply server response
-- Update local state with acked results.
-- Handle conflicts from response.
-
-## Notes
-
-- Current storage in backend is in-memory map based.
-- Teams can replace store and auth parts based on app needs.
+- TUF: [The Update Framework](https://theupdateframework.io/)
+- Event sourcing pattern: [Microsoft Learn](https://learn.microsoft.com/azure/architecture/patterns/event-sourcing)
+- IndexedDB outbox reference: [Dexie docs](https://dexie.org/docs/)
+- Background Sync reference: [MDN](https://developer.mozilla.org/docs/Web/API/Background_Synchronization_API)

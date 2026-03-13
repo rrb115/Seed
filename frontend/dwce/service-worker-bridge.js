@@ -12,8 +12,8 @@ export class ServiceWorkerBridge {
     return registration;
   }
 
-  async importManifest(manifest, publicKey) {
-    const payload = { type: "IMPORT_MANIFEST", manifest, publicKey };
+  async importManifest(manifest) {
+    const payload = { type: "IMPORT_MANIFEST", manifest };
     return this.#post(payload);
   }
 

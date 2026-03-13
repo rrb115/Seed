@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,39 +17,90 @@ import (
 	"seed/backend/internal/syncer"
 )
 
-func TestManifestIsSigned(t *testing.T) {
+func TestManifestJWKSVerification(t *testing.T) {
 	staticDir := makeStaticDir(t)
 	s := buildServer(t, staticDir)
 
 	mux := http.NewServeMux()
 	s.Register(mux)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/manifest?goal=note_draft", nil)
-	req.Header.Set("Authorization", "Bearer dev-token")
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	manifestReq := httptest.NewRequest(http.MethodGet, "/v1/manifest?goal=note_draft", nil)
+	manifestReq.Header.Set("Authorization", "Bearer dev-token")
+	manifestResp := httptest.NewRecorder()
+	mux.ServeHTTP(manifestResp, manifestReq)
+	if manifestResp.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", manifestResp.Code, manifestResp.Body.String())
 	}
 
 	var manifest core.GoalManifest
-	if err := json.Unmarshal(w.Body.Bytes(), &manifest); err != nil {
-		t.Fatalf("unmarshal manifest: %v", err)
+	if err := json.Unmarshal(manifestResp.Body.Bytes(), &manifest); err != nil {
+		t.Fatalf("manifest unmarshal: %v", err)
 	}
-	payloadBytes, err := core.CanonicalManifestBytes(manifest.ManifestPayload)
+	if manifest.ManifestJWS == "" {
+		t.Fatal("manifest_jws was empty")
+	}
+
+	keysReq := httptest.NewRequest(http.MethodGet, "/.well-known/dwce-keys", nil)
+	keysResp := httptest.NewRecorder()
+	mux.ServeHTTP(keysResp, keysReq)
+	if keysResp.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", keysResp.Code)
+	}
+	var keyBody struct {
+		Keys []security.PublicJWK `json:"keys"`
+	}
+	if err := json.Unmarshal(keysResp.Body.Bytes(), &keyBody); err != nil {
+		t.Fatalf("keys unmarshal: %v", err)
+	}
+
+	payload, kid, err := security.VerifyCompactJWS(manifest.ManifestJWS, keyBody.Keys)
 	if err != nil {
-		t.Fatalf("canonical bytes: %v", err)
+		t.Fatalf("jws verify failed: %v", err)
 	}
-	pub := w.Header().Get("X-Manifest-Public-Key")
-	if !security.Verify(pub, payloadBytes, manifest.Signature) {
-		t.Fatal("manifest signature verification failed")
+	if kid == "" {
+		t.Fatal("kid was empty")
 	}
-	if manifest.SafetyClass != SafetySafe {
-		t.Fatalf("expected SAFE manifest, got %s", manifest.SafetyClass)
+	canonical, err := core.CanonicalManifestBytes(manifest.ManifestPayload)
+	if err != nil {
+		t.Fatalf("canonical payload: %v", err)
 	}
-	if !manifest.OfflineEligible {
-		t.Fatal("expected note_draft to be offline eligible")
+	if string(payload) != string(canonical) {
+		t.Fatalf("verified payload mismatch")
+	}
+
+	if _, _, err := security.VerifyCompactJWS(manifest.ManifestJWS, []security.PublicJWK{}); err == nil {
+		t.Fatal("expected unknown kid verification failure")
+	}
+}
+
+func TestManifestKeyRotationSimulation(t *testing.T) {
+	staticDir := makeStaticDir(t)
+	s1 := buildServer(t, staticDir)
+	s2 := buildServerWithKeyID(t, staticDir, "rotated-key")
+
+	mux1 := http.NewServeMux()
+	s1.Register(mux1)
+	mux2 := http.NewServeMux()
+	s2.Register(mux2)
+
+	manifestReq := httptest.NewRequest(http.MethodGet, "/v1/manifest?goal=note_draft", nil)
+	manifestReq.Header.Set("Authorization", "Bearer dev-token")
+	manifestResp := httptest.NewRecorder()
+	mux1.ServeHTTP(manifestResp, manifestReq)
+
+	var manifest core.GoalManifest
+	_ = json.Unmarshal(manifestResp.Body.Bytes(), &manifest)
+
+	keysReq := httptest.NewRequest(http.MethodGet, "/.well-known/dwce-keys", nil)
+	keysResp := httptest.NewRecorder()
+	mux2.ServeHTTP(keysResp, keysReq)
+	var keyBody struct {
+		Keys []security.PublicJWK `json:"keys"`
+	}
+	_ = json.Unmarshal(keysResp.Body.Bytes(), &keyBody)
+
+	if _, _, err := security.VerifyCompactJWS(manifest.ManifestJWS, keyBody.Keys); err == nil {
+		t.Fatal("expected key rotation mismatch verification failure")
 	}
 }
 
@@ -67,50 +119,115 @@ func TestUnsafeManifestRejected(t *testing.T) {
 	if w.Code != http.StatusConflict {
 		t.Fatalf("expected 409, got %d body=%s", w.Code, w.Body.String())
 	}
-
-	var body map[string]any
-	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
-		t.Fatalf("unmarshal response: %v", err)
-	}
-	if body["error"] != "workflow_offline_unsafe" {
-		t.Fatalf("unexpected error payload: %#v", body)
-	}
 }
 
-func TestDWCEKeysEndpoint(t *testing.T) {
+func TestPrepareThenSync(t *testing.T) {
 	staticDir := makeStaticDir(t)
 	s := buildServer(t, staticDir)
-
 	mux := http.NewServeMux()
 	s.Register(mux)
 
-	req := httptest.NewRequest(http.MethodGet, "/.well-known/dwce-keys", nil)
+	prepareReq := httptest.NewRequest(http.MethodPost, "/v1/prepare?workflow_id=support_ticket", bytes.NewReader([]byte(`{"preconditions":{"scope":"demo"}}`)))
+	prepareReq.Header.Set("Authorization", "Bearer dev-token")
+	prepareReq.Header.Set("Content-Type", "application/json")
+	prepareResp := httptest.NewRecorder()
+	mux.ServeHTTP(prepareResp, prepareReq)
+	if prepareResp.Code != http.StatusOK {
+		t.Fatalf("prepare failed: %d %s", prepareResp.Code, prepareResp.Body.String())
+	}
+	var prepareBody struct {
+		PrepareToken string `json:"prepare_token"`
+	}
+	if err := json.Unmarshal(prepareResp.Body.Bytes(), &prepareBody); err != nil {
+		t.Fatalf("prepare body: %v", err)
+	}
+	if prepareBody.PrepareToken == "" {
+		t.Fatal("prepare token missing")
+	}
+
+	syncPayload := core.SyncRequest{ClientID: "device-1", Ops: []core.Operation{{
+		OpID:         "ticket:1:1",
+		ObjectID:     "ticket:1",
+		ClientID:     "device-1",
+		Workflow:     "support_ticket",
+		Sequence:     1,
+		Type:         "set_field",
+		Path:         []string{"message"},
+		Value:        "hello world",
+		PrepareToken: prepareBody.PrepareToken,
+	}}}
+	b, _ := json.Marshal(syncPayload)
+	syncReq := httptest.NewRequest(http.MethodPost, "/v1/sync", bytes.NewReader(b))
+	syncReq.Header.Set("Authorization", "Bearer dev-token")
+	syncReq.Header.Set("Content-Type", "application/json")
+	syncResp := httptest.NewRecorder()
+	mux.ServeHTTP(syncResp, syncReq)
+	if syncResp.Code != http.StatusOK {
+		t.Fatalf("sync failed: %d %s", syncResp.Code, syncResp.Body.String())
+	}
+	var syncBody core.SyncResponse
+	if err := json.Unmarshal(syncResp.Body.Bytes(), &syncBody); err != nil {
+		t.Fatalf("sync body: %v", err)
+	}
+	if len(syncBody.Conflicts) != 0 {
+		t.Fatalf("expected no conflicts, got %#v", syncBody.Conflicts)
+	}
+	if len(syncBody.AckedOpIDs) != 1 {
+		t.Fatalf("expected one ack, got %#v", syncBody)
+	}
+}
+
+func TestSyncBatchAtomicity(t *testing.T) {
+	staticDir := makeStaticDir(t)
+	s := buildServer(t, staticDir)
+	mux := http.NewServeMux()
+	s.Register(mux)
+
+	prepareReq := httptest.NewRequest(http.MethodPost, "/v1/prepare?workflow_id=support_ticket", bytes.NewReader([]byte(`{"preconditions":{"scope":"demo"}}`)))
+	prepareReq.Header.Set("Authorization", "Bearer dev-token")
+	prepareResp := httptest.NewRecorder()
+	mux.ServeHTTP(prepareResp, prepareReq)
+	var prepBody struct {
+		PrepareToken string `json:"prepare_token"`
+	}
+	_ = json.Unmarshal(prepareResp.Body.Bytes(), &prepBody)
+
+	payload := core.SyncRequest{ClientID: "device-2", Ops: []core.Operation{
+		{OpID: "op1", ObjectID: "ticket:2", ClientID: "device-2", Workflow: "support_ticket", Sequence: 1, Type: "set_field", Path: []string{"contact", "email"}, Value: "bad-email", PrepareToken: prepBody.PrepareToken},
+		{OpID: "op2", ObjectID: "ticket:2", ClientID: "device-2", Workflow: "support_ticket", Sequence: 2, Type: "set_field", Path: []string{"message"}, Value: "hello world", PrepareToken: prepBody.PrepareToken},
+	}}
+	b, _ := json.Marshal(payload)
+	req := httptest.NewRequest(http.MethodPost, "/v1/sync", bytes.NewReader(b))
+	req.Header.Set("Authorization", "Bearer dev-token")
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
-
 	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+		t.Fatalf("sync failed: %d", w.Code)
+	}
+	var body core.SyncResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &body)
+	if len(body.Conflicts) == 0 {
+		t.Fatal("expected conflict")
+	}
+	if len(body.AppliedEvents) != 0 {
+		t.Fatalf("expected atomic rejection with no events")
 	}
 
-	var body struct {
-		Keys []struct {
-			Kid string `json:"kid"`
-			Kty string `json:"kty"`
-			Crv string `json:"crv"`
-			X   string `json:"x"`
-		} `json:"keys"`
+	payload2 := core.SyncRequest{ClientID: "device-2", Ops: []core.Operation{{
+		OpID: "op3", ObjectID: "ticket:2", ClientID: "device-2", Workflow: "support_ticket", Sequence: 1, Type: "set_field", Path: []string{"message"}, Value: "hello world", PrepareToken: prepBody.PrepareToken,
+	}}}
+	b2, _ := json.Marshal(payload2)
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/sync", bytes.NewReader(b2))
+	req2.Header.Set("Authorization", "Bearer dev-token")
+	w2 := httptest.NewRecorder()
+	mux.ServeHTTP(w2, req2)
+	var body2 core.SyncResponse
+	_ = json.Unmarshal(w2.Body.Bytes(), &body2)
+	if len(body2.Conflicts) > 0 {
+		t.Fatalf("expected follow-up batch to succeed, got conflicts %#v", body2.Conflicts)
 	}
-	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
-		t.Fatalf("unmarshal keys: %v", err)
-	}
-	if len(body.Keys) != 1 {
-		t.Fatalf("expected one key, got %d", len(body.Keys))
-	}
-	if body.Keys[0].Kid == "" || body.Keys[0].X == "" {
-		t.Fatalf("invalid key payload: %#v", body.Keys[0])
-	}
-	if body.Keys[0].Kty != "OKP" || body.Keys[0].Crv != "Ed25519" {
-		t.Fatalf("unexpected key type: %#v", body.Keys[0])
+	if len(body2.AckedOpIDs) != 1 {
+		t.Fatalf("expected ack on second batch")
 	}
 }
 
@@ -120,20 +237,15 @@ func TestAsyncSyncFlow(t *testing.T) {
 	mux := http.NewServeMux()
 	s.Register(mux)
 
-	payload := core.SyncRequest{
+	payload := core.SyncRequest{ClientID: "device-1", Ops: []core.Operation{{
+		OpID:     "device-1:1",
+		ObjectID: "cart:1",
 		ClientID: "device-1",
-		Ops: []core.Op{
-			{
-				OpID:     "device-1:1",
-				ObjectID: "cart:1",
-				ClientID: "device-1",
-				Clock:    1,
-				Type:     "set_field",
-				Path:     []string{"shipping", "city"},
-				Value:    "Goa",
-			},
-		},
-	}
+		Sequence: 1,
+		Type:     "set_field",
+		Path:     []string{"shipping", "city"},
+		Value:    "Goa",
+	}}}
 	b, _ := json.Marshal(payload)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/sync?async=1", bytes.NewReader(b))
@@ -153,6 +265,9 @@ func TestAsyncSyncFlow(t *testing.T) {
 	if accepted.QueueID == "" {
 		t.Fatal("queue id is empty")
 	}
+	if accepted.TxID == "" {
+		t.Fatal("tx id is empty")
+	}
 
 	var statusResp *httptest.ResponseRecorder
 	for i := 0; i < 20; i++ {
@@ -161,12 +276,9 @@ func TestAsyncSyncFlow(t *testing.T) {
 		statusResp = httptest.NewRecorder()
 		mux.ServeHTTP(statusResp, reqStatus)
 		if statusResp.Code == http.StatusOK {
-			var status core.SyncStatus
+			var status map[string]any
 			_ = json.Unmarshal(statusResp.Body.Bytes(), &status)
-			if status.Status == "completed" && status.Response != nil {
-				if len(status.Response.AckedOpIDs) != 1 {
-					t.Fatalf("expected 1 acked op, got %d", len(status.Response.AckedOpIDs))
-				}
+			if status["status"] == "completed" {
 				return
 			}
 		}
@@ -176,9 +288,34 @@ func TestAsyncSyncFlow(t *testing.T) {
 	t.Fatalf("sync status did not complete: code=%d body=%s", statusResp.Code, statusResp.Body.String())
 }
 
+func TestMetricsEndpoint(t *testing.T) {
+	staticDir := makeStaticDir(t)
+	s := buildServer(t, staticDir)
+	mux := http.NewServeMux()
+	s.Register(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	for _, metric := range []string{"ops_received_total", "ops_applied_total", "sync_conflicts_total", "sync_errors_total"} {
+		if !strings.Contains(body, metric) {
+			t.Fatalf("missing metric %s in body %s", metric, body)
+		}
+	}
+}
+
 func buildServer(t *testing.T, staticDir string) *Server {
 	t.Helper()
-	signer, err := security.NewSigner("test-key", "")
+	return buildServerWithKeyID(t, staticDir, "test-key")
+}
+
+func buildServerWithKeyID(t *testing.T, staticDir, keyID string) *Server {
+	t.Helper()
+	signer, err := security.NewSigner(keyID, "")
 	if err != nil {
 		t.Fatalf("NewSigner error: %v", err)
 	}

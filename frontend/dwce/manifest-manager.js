@@ -8,7 +8,7 @@ export class ManifestManager {
   }
 
   async prepareWorkflowManifest(goal, steps, resourceClosure) {
-    const qs = new URLSearchParams({ goal });
+    const qs = new URLSearchParams({ goal, include_prepare: "1" });
     if (steps?.length) {
       qs.set("steps", steps.join(","));
     }
@@ -33,13 +33,8 @@ export class ManifestManager {
     }
 
     const manifest = await response.json();
-    const publicKey = response.headers.get("X-Manifest-Public-Key");
-
-    if (!publicKey) {
-      throw new Error("manifest response missing public key");
-    }
-
-    const swResult = await this.swBridge.importManifest(manifest, publicKey);
+    assertManifestShape(manifest);
+    const swResult = await this.swBridge.importManifest(manifest);
     if (!swResult?.ok) {
       throw new Error(swResult?.error || "service worker manifest import failed");
     }
@@ -47,6 +42,7 @@ export class ManifestManager {
     await put("manifests", {
       manifest_id: manifest.manifest_id,
       goal: manifest.goal,
+      version: manifest.version,
       created_at: manifest.created_at,
       expires_at: manifest.expires_at,
       payload: manifest,
@@ -70,5 +66,27 @@ export class ManifestManager {
     });
 
     return manifest;
+  }
+}
+
+function assertManifestShape(manifest) {
+  if (!manifest || typeof manifest !== "object") {
+    throw new Error("manifest payload invalid");
+  }
+  if (!Array.isArray(manifest.resources)) {
+    throw new Error("manifest resources missing");
+  }
+  // Compatibility: backend currently names workflow as goal.
+  if (!manifest.workflow && !manifest.goal) {
+    throw new Error("manifest workflow missing");
+  }
+  if (typeof manifest.version !== "number") {
+    throw new Error("manifest version missing");
+  }
+  if (!manifest.expires_at || !manifest.key_id) {
+    throw new Error("manifest expiry or key id missing");
+  }
+  if (!manifest.manifest_jws) {
+    throw new Error("manifest_jws missing");
   }
 }

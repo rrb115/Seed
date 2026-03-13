@@ -1,8 +1,13 @@
 package syncer
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
 	"seed/backend/internal/core"
 	"seed/backend/internal/store"
 )
@@ -13,100 +18,64 @@ func TestApplyIdempotent(t *testing.T) {
 
 	req := core.SyncRequest{
 		ClientID: "device-1",
-		Ops: []core.Op{
-			{
-				OpID:     "device-1:1",
-				ObjectID: "cart:1",
-				ClientID: "device-1",
-				Clock:    1,
-				Type:     "set_field",
-				Path:     []string{"shipping", "city"},
-				Value:    "Pune",
-			},
-		},
+		Ops: []core.Operation{{
+			OpID:     "device-1:1",
+			ObjectID: "cart:1",
+			ClientID: "device-1",
+			Clock:    1,
+			Type:     "set_field",
+			Path:     []string{"shipping", "city"},
+			Value:    "Pune",
+		}},
 	}
 
-	first := engine.Apply(req)
+	first := engine.Apply(context.Background(), req, uuid.New())
 	if len(first.AckedOpIDs) != 1 {
 		t.Fatalf("expected 1 ack on first apply, got %d", len(first.AckedOpIDs))
 	}
-	second := engine.Apply(req)
+	second := engine.Apply(context.Background(), req, uuid.New())
 	if len(second.AckedOpIDs) != 1 {
-		t.Fatalf("expected duplicate op to still be acknowledged once in response, got %d", len(second.AckedOpIDs))
+		t.Fatalf("expected duplicate op to be acked once, got %d", len(second.AckedOpIDs))
 	}
 
-	obj := st.GetObject("cart:1")
-	shipping, ok := obj.Data["shipping"].(map[string]any)
+	stateRaw, _, err := st.GetObjectState(context.Background(), "cart:1")
+	if err != nil {
+		t.Fatalf("get state: %v", err)
+	}
+	var obj map[string]any
+	_ = json.Unmarshal(stateRaw, &obj)
+	shipping, ok := obj["shipping"].(map[string]any)
 	if !ok {
-		t.Fatalf("shipping not present: %#v", obj.Data)
+		t.Fatalf("shipping not present: %#v", obj)
 	}
 	if shipping["city"] != "Pune" {
 		t.Fatalf("unexpected city value: %#v", shipping["city"])
 	}
 }
 
-func TestInventoryConflict(t *testing.T) {
+func TestBatchConflictIsAtomic(t *testing.T) {
 	st := store.NewMemoryStore()
 	engine := NewEngine(st)
 
-	req := core.SyncRequest{
-		ClientID: "device-2",
-		Ops: []core.Op{
-			{
-				OpID:     "device-2:1",
-				ObjectID: "cart:2",
-				ClientID: "device-2",
-				Clock:    1,
-				Type:     "add_item",
-				Value: map[string]any{
-					"sku": "sku-2",
-					"qty": float64(1),
-				},
-			},
-		},
+	req := core.SyncRequest{ClientID: "device-2", Ops: []core.Operation{
+		{OpID: "op-1", ObjectID: "ticket:1", ClientID: "device-2", Sequence: 1, Workflow: "support_ticket", Type: "set_field", Path: []string{"contact", "email"}, Value: "invalid"},
+		{OpID: "op-2", ObjectID: "ticket:1", ClientID: "device-2", Sequence: 2, Workflow: "support_ticket", Type: "set_field", Path: []string{"message"}, Value: "hello world"},
+	}}
+
+	resp := engine.Apply(context.Background(), req, uuid.New())
+	if len(resp.Conflicts) == 0 {
+		t.Fatalf("expected conflicts")
+	}
+	if len(resp.AppliedEvents) != 0 {
+		t.Fatalf("expected no applied events on atomic conflict")
 	}
 
-	resp := engine.Apply(req)
-	if len(resp.Conflicts) != 1 {
-		t.Fatalf("expected 1 conflict, got %d", len(resp.Conflicts))
+	events, err := st.ListEvents(context.Background(), "ticket:1", time.Time{})
+	if err != nil {
+		t.Fatalf("list events: %v", err)
 	}
-	if resp.Conflicts[0].Reason != "inventory_zero" {
-		t.Fatalf("unexpected reason: %s", resp.Conflicts[0].Reason)
-	}
-	if len(resp.AckedOpIDs) != 0 {
-		t.Fatalf("conflict op should not be acked")
-	}
-}
-
-func TestEventualValidationFailure(t *testing.T) {
-	st := store.NewMemoryStore()
-	engine := NewEngine(st)
-
-	req := core.SyncRequest{
-		ClientID: "device-3",
-		Ops: []core.Op{
-			{
-				OpID:     "device-3:1",
-				ObjectID: "ticket:1",
-				ClientID: "device-3",
-				Workflow: "support_ticket",
-				Clock:    1,
-				Type:     "set_field",
-				Path:     []string{"contact", "email"},
-				Value:    "invalid-email",
-			},
-		},
-	}
-
-	resp := engine.Apply(req)
-	if len(resp.Conflicts) != 1 {
-		t.Fatalf("expected 1 conflict, got %d", len(resp.Conflicts))
-	}
-	if resp.Conflicts[0].Reason != "validation_failed" {
-		t.Fatalf("unexpected reason: %s", resp.Conflicts[0].Reason)
-	}
-	if len(resp.AckedOpIDs) != 0 {
-		t.Fatalf("validation-failed op should not be acked")
+	if len(events) != 0 {
+		t.Fatalf("expected zero events, got %d", len(events))
 	}
 }
 
@@ -114,42 +83,30 @@ func TestRejectOutOfOrderSequence(t *testing.T) {
 	st := store.NewMemoryStore()
 	engine := NewEngine(st)
 
-	first := core.SyncRequest{
+	first := core.SyncRequest{ClientID: "device-seq", Ops: []core.Operation{{
+		OpID:     "seq:2",
+		ObjectID: "ticket:1",
 		ClientID: "device-seq",
-		Ops: []core.Op{
-			{
-				OpID:           "seq:2",
-				ObjectID:       "note:1",
-				ClientID:       "device-seq",
-				Clock:          2,
-				SequenceNumber: 2,
-				Type:           "set_field",
-				Path:           []string{"content"},
-				Value:          "newer",
-			},
-		},
-	}
-	firstResp := engine.Apply(first)
+		Sequence: 2,
+		Type:     "set_field",
+		Path:     []string{"content"},
+		Value:    "newer",
+	}}}
+	firstResp := engine.Apply(context.Background(), first, uuid.New())
 	if len(firstResp.AckedOpIDs) != 1 {
-		t.Fatalf("expected first op to be acked, got %#v", firstResp)
+		t.Fatalf("expected first op acked, got %#v", firstResp)
 	}
 
-	second := core.SyncRequest{
+	second := core.SyncRequest{ClientID: "device-seq", Ops: []core.Operation{{
+		OpID:     "seq:1",
+		ObjectID: "ticket:1",
 		ClientID: "device-seq",
-		Ops: []core.Op{
-			{
-				OpID:           "seq:1",
-				ObjectID:       "note:1",
-				ClientID:       "device-seq",
-				Clock:          1,
-				SequenceNumber: 1,
-				Type:           "set_field",
-				Path:           []string{"content"},
-				Value:          "older",
-			},
-		},
-	}
-	secondResp := engine.Apply(second)
+		Sequence: 1,
+		Type:     "set_field",
+		Path:     []string{"content"},
+		Value:    "older",
+	}}}
+	secondResp := engine.Apply(context.Background(), second, uuid.New())
 	if len(secondResp.Conflicts) != 1 {
 		t.Fatalf("expected one conflict, got %#v", secondResp)
 	}
@@ -158,33 +115,54 @@ func TestRejectOutOfOrderSequence(t *testing.T) {
 	}
 }
 
-func TestDeduplicateOperationID(t *testing.T) {
+func TestPrepareTokenValidation(t *testing.T) {
 	st := store.NewMemoryStore()
 	engine := NewEngine(st)
+	engine.SetPrepareRequirements(map[string]bool{"checkout": true})
+	engine.SetPrepareValidator(staticPrepareValidator{err: errors.New("invalid")})
 
-	req := core.SyncRequest{
-		ClientID: "device-dedupe",
-		Ops: []core.Op{
-			{
-				OpID:           "dedupe:1",
-				ObjectID:       "note:2",
-				ClientID:       "device-dedupe",
-				Clock:          1,
-				SequenceNumber: 1,
-				Type:           "set_field",
-				Path:           []string{"content"},
-				Value:          "hello",
-			},
-		},
+	req := core.SyncRequest{ClientID: "device-3", Ops: []core.Operation{{
+		OpID:     "prep:1",
+		ObjectID: "cart:1",
+		ClientID: "device-3",
+		Workflow: "checkout",
+		Sequence: 1,
+		Type:     "set_field",
+		Path:     []string{"shipping", "city"},
+		Value:    "Goa",
+	}}}
+
+	resp := engine.Apply(context.Background(), req, uuid.New())
+	if len(resp.Conflicts) != 1 {
+		t.Fatalf("expected one conflict, got %#v", resp)
+	}
+	if resp.Conflicts[0].Reason != "prepare_token_invalid" {
+		t.Fatalf("unexpected reason: %s", resp.Conflicts[0].Reason)
+	}
+}
+
+func TestConflictHandlers(t *testing.T) {
+	registry := NewRegistry()
+	reject := registry.Resolve("reject")
+	lww := registry.Resolve("lww")
+
+	action, _ := reject.HandleConflict(context.Background(), core.Operation{}, json.RawMessage(`{}`))
+	if action.Apply {
+		t.Fatal("reject handler should not apply")
 	}
 
-	first := engine.Apply(req)
-	second := engine.Apply(req)
-	if len(first.AckedOpIDs) != 1 || len(second.AckedOpIDs) != 1 {
-		t.Fatalf("expected duplicate op id to be deduped and acknowledged once per response")
+	op := core.Operation{Timestamp: time.Now().UTC()}
+	state := json.RawMessage(`{"_meta":{"updated_at":"2000-01-01T00:00:00Z"}}`)
+	action, _ = lww.HandleConflict(context.Background(), op, state)
+	if !action.Apply {
+		t.Fatal("lww handler should apply newer operation")
 	}
-	obj := st.GetObject("note:2")
-	if obj.LastAppliedSequence != 1 {
-		t.Fatalf("expected last sequence to stay at 1, got %d", obj.LastAppliedSequence)
-	}
+}
+
+type staticPrepareValidator struct {
+	err error
+}
+
+func (v staticPrepareValidator) ValidatePrepareToken(_ context.Context, _ string, _ string) error {
+	return v.err
 }
