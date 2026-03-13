@@ -1,18 +1,43 @@
-# Seed DWCE Setup Guide
+# Seed Implementation Guide
 
-This repo has two parts:
+## What Seed is
 
-- `backend/` Go API and sync engine
-- `frontend/` client for API checks
+Seed is an implementation for workflow cache, local operation queue, and sync APIs.
 
-## Current backend state
+Seed has two parts:
 
-- Storage uses in-memory maps in `backend/internal/store/memory.go`.
-- Signing uses Ed25519 in `backend/internal/security/signer.go`.
-- Key discovery endpoint: `GET /.well-known/dwce-keys`.
-- Manifest endpoint: `GET /v1/manifest`.
-- Sync endpoints: `POST /v1/sync`, `GET /v1/sync/status`.
-- Resource check endpoint: `POST /v1/verify-resource`.
+- `backend/`: Go server for manifest, sync, and key endpoints.
+- `frontend/`: client used to call APIs and test workflow flows.
+
+Seed is the implementation name in this repo.
+
+## How Seed works
+
+1. Client calls `GET /v1/manifest?goal=<workflow>`.
+2. Server returns a signed manifest with workflow steps and resources.
+3. Client stores resources and records user operations in local storage.
+4. Client sends batched operations to `POST /v1/sync`.
+5. Server validates and applies operations.
+6. Client reads result from sync response or `GET /v1/sync/status` when async mode is used.
+
+## Code map
+
+- Server entry: `backend/cmd/server/main.go`
+- API routes and workflow maps: `backend/internal/api/server.go`
+- Data models: `backend/internal/core/types.go`
+- Manifest signing: `backend/internal/security/signer.go`
+- Sync rules and apply logic: `backend/internal/syncer/engine.go`
+- In-memory store: `backend/internal/store/memory.go`
+- Client runtime modules: `frontend/dwce/*.js`
+- Service worker: `frontend/sw.js`
+
+## API list
+
+- `GET /.well-known/dwce-keys`
+- `GET /v1/manifest`
+- `POST /v1/sync`
+- `GET /v1/sync/status`
+- `POST /v1/verify-resource`
 
 ## Run
 
@@ -30,95 +55,60 @@ cd backend
 go test ./...
 ```
 
-## What teams must rewire for their app
+## What to change for your web app
 
-1. Workflow list and step graph
+1. Workflow IDs, steps, and resource paths
 - File: `backend/internal/api/server.go`
 - Update `manifestTemplates()` and `workflowGraphs()`.
-- Add your workflow IDs, steps, and resource paths.
-- Set safety flags for each workflow.
 
 2. Auth check
 - File: `backend/internal/api/server.go`
-- Replace `withAuth()` token compare with your auth flow.
-- Validate user and scopes before manifest and sync routes.
+- Replace token compare in `withAuth()` with your auth check.
 
 3. Signing key source
 - File: `backend/internal/security/signer.go`
-- Keep Ed25519 format.
-- Replace local seed source with your key source if needed.
-- Keep `kid` stable for active key set.
+- Keep Ed25519 output and `kid` values.
+- Replace seed source if your key source is different.
 
-4. Sync validation rules
+4. Sync rule set
 - File: `backend/internal/syncer/engine.go`
-- Update `validateWorkflowOperation()` with app rules.
-- Keep sequence checks and op-id dedupe checks.
+- Update `validateWorkflowOperation()` with your rule set.
+- Keep op-id dedupe and sequence checks.
 
-5. Store layer
+5. Storage layer
 - File: `backend/internal/store/memory.go`
-- Keep map store for local use.
-- If needed, replace with your store and keep method behavior:
+- Current implementation uses in-memory maps.
+- Keep map store or replace with your store.
+- Keep behavior for:
   - op dedupe lookup
   - object read/write
   - sync status read/write
   - last applied sequence tracking
 
-6. API contract fields
-- File: `backend/internal/core/types.go`
-- Keep these op fields in client payloads:
-  - `op_id`
-  - `object_id`
-  - `client_id`
-  - `workflow`
-  - `sequence_number` (or `clock` fallback)
-  - `type`, `path`, `value`
-- Keep these sync request fields:
-  - `client_id`
-  - `manifest_version`
-  - `ops[]`
+## Client integration steps for another app
 
-## Integration steps for another web app
-
-1. Add a client queue
-- Store ops in browser storage.
+1. Build local queue
+- Store operations in browser storage.
 - Increment `sequence_number` per `object_id`.
 
-2. Fetch manifest
+2. Fetch and verify manifest
 - Call `GET /v1/manifest?goal=<workflow>`.
-- Verify signature using keys from `GET /.well-known/dwce-keys`.
-- Cache listed resources.
+- Fetch keys from `GET /.well-known/dwce-keys`.
+- Verify signature before caching resources.
 
-3. Record actions
-- Convert each user action to an op.
-- Save op before showing saved state in UI.
+3. Record operations
+- Map each user action to one operation payload.
+- Save operation before showing saved state.
 
-4. Sync ops
+4. Sync
 - Send batches to `POST /v1/sync`.
-- If `202`, poll `GET /v1/sync/status?queue_id=<id>`.
+- If response is `202`, poll `GET /v1/sync/status?queue_id=<id>`.
 
-5. Apply result
-- For each op, handle status by server response:
-  - acked
-  - conflict/rejected
-- Update local state and UI state.
+5. Apply server response
+- Update local state with acked results.
+- Handle conflicts from response.
 
-6. Handle unsafe workflows
-- If manifest call returns `409 workflow_offline_unsafe`, block run without network.
-- Keep user input as draft if needed.
+## Notes
 
-## Where to plug this into your app
-
-- Web app backend service layer:
-  - call manifest and sync APIs
-- Workflow module:
-  - map UI actions to op payloads
-- Cache module:
-  - cache resources from signed manifest
-- Sync module:
-  - batch submit and status polling
-
-## Frontend folder use
-
-- `frontend/` is for API checks and flow checks.
-- You can replace it with your app client.
-- Backend APIs run without this folder if you provide another client.
+- Current storage in backend is in-memory map based.
+- Teams can replace store and auth parts based on app needs.
