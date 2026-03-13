@@ -4,7 +4,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Seed | Offline Runtime</title>
+  <title>Seed | Client</title>
   <link rel="stylesheet" href="/styles.css" />
 </head>
 
@@ -14,7 +14,7 @@
       <p class="eyebrow">Workflow Engine</p>
       <h1>Seed</h1>
       <p class="lede">
-        SDK for offline caching, resource closure, and operation syncing.
+        Client for manifest, queue, and sync checks.
       </p>
     </header>
 
@@ -34,7 +34,7 @@
             <option value="checkout">Checkout (UNSAFE)</option>
           </select>
         </div>
-        <p id="workflow-safety" style="margin-top:0.5rem;font-size:0.8rem;color:var(--text-secondary);">Select a workflow.</p>
+        <p id="workflow-safety" style="margin-top:0.5rem;font-size:0.8rem;color:var(--text-secondary);">Choose a workflow.</p>
         <button id="prepare-goal">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
             stroke-linecap="round" stroke-linejoin="round">
@@ -59,7 +59,7 @@
           </div>
         </div>
 
-        <p id="manifest-status" style="margin-top: 1rem; font-size: 0.875rem; color: var(--text-secondary);">Ready.</p>
+        <p id="manifest-status" style="margin-top: 1rem; font-size: 0.875rem; color: var(--text-secondary);">Idle.</p>
       </section>
 
       <section class="card">
@@ -126,7 +126,7 @@
           Sync
         </button>
       </div>
-      <p id="sync-status" style="font-size: 0.875rem; color: var(--text-secondary); margin-bottom: 1rem;">No attempts.
+      <p id="sync-status" style="font-size: 0.875rem; color: var(--text-secondary); margin-bottom: 1rem;">Idle.
       </p>
 
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem;">
@@ -144,7 +144,7 @@
 
   <script src="/app.js" type="module"></script>
   <script>
-    // Simple toggle for operation parameters UI
+    // Toggle for operation parameter inputs
     document.getElementById('op-type').addEventListener('change', (e) => {
       const isField = e.target.value === 'set_field';
       document.getElementById('op-params-standard').style.display = isField ? 'none' : 'grid';

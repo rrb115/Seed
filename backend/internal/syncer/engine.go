@@ -53,6 +53,31 @@ func (e *Engine) Apply(req core.SyncRequest) core.SyncResponse {
 		}
 
 		object := e.store.GetObject(op.ObjectID)
+		seq := effectiveSequence(op)
+		if seq == 0 {
+			conflicts = append(conflicts, core.Conflict{
+				ObjectID:  op.ObjectID,
+				OpID:      op.OpID,
+				Reason:    "invalid_sequence",
+				Suggested: "drop",
+				Metadata:  map[string]any{"detail": "sequence_number (or clock) must be > 0"},
+			})
+			continue
+		}
+		if seq <= object.LastAppliedSequence {
+			conflicts = append(conflicts, core.Conflict{
+				ObjectID:  op.ObjectID,
+				OpID:      op.OpID,
+				Reason:    "out_of_order_sequence",
+				Suggested: "drop",
+				Metadata: map[string]any{
+					"sequence_number":       seq,
+					"last_applied_sequence": object.LastAppliedSequence,
+				},
+			})
+			continue
+		}
+
 		applied, conflict := e.applyOne(&object, op)
 		if conflict != nil {
 			conflicts = append(conflicts, *conflict)
@@ -62,6 +87,7 @@ func (e *Engine) Apply(req core.SyncRequest) core.SyncResponse {
 			if op.Clock > object.VersionVector[op.ClientID] {
 				object.VersionVector[op.ClientID] = op.Clock
 			}
+			object.LastAppliedSequence = seq
 			e.store.PutObject(op.ObjectID, object)
 			e.store.MarkAcked(op.OpID)
 			acked = append(acked, op.OpID)
@@ -74,9 +100,10 @@ func (e *Engine) Apply(req core.SyncRequest) core.SyncResponse {
 	for objectID := range touched {
 		obj := e.store.GetObject(objectID)
 		results = append(results, core.ObjectResult{
-			ObjectID:      objectID,
-			State:         obj.Data,
-			VersionVector: obj.VersionVector,
+			ObjectID:            objectID,
+			State:               obj.Data,
+			VersionVector:       obj.VersionVector,
+			LastAppliedSequence: obj.LastAppliedSequence,
 		})
 	}
 	sort.Slice(results, func(i, j int) bool { return results[i].ObjectID < results[j].ObjectID })
@@ -88,6 +115,13 @@ func (e *Engine) Apply(req core.SyncRequest) core.SyncResponse {
 		Conflicts:  conflicts,
 		Status:     "completed",
 	}
+}
+
+func effectiveSequence(op core.Op) uint64 {
+	if op.SequenceNumber > 0 {
+		return op.SequenceNumber
+	}
+	return op.Clock
 }
 
 func (e *Engine) applyOne(object *store.ObjectState, op core.Op) (bool, *core.Conflict) {

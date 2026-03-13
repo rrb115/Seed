@@ -35,19 +35,22 @@ type GoalManifest struct {
 
 // Op is a single user intent mutation queued while offline.
 type Op struct {
-	OpID     string   `json:"op_id"`
-	ObjectID string   `json:"object_id"`
-	ClientID string   `json:"client_id"`
-	Workflow string   `json:"workflow,omitempty"`
-	Clock    uint64   `json:"clock"`
-	Type     string   `json:"type"`
-	Path     []string `json:"path,omitempty"`
-	Value    any      `json:"value,omitempty"`
+	OpID           string    `json:"op_id"`
+	ObjectID       string    `json:"object_id"`
+	ClientID       string    `json:"client_id"`
+	Workflow       string    `json:"workflow,omitempty"`
+	Clock          uint64    `json:"clock"`
+	SequenceNumber uint64    `json:"sequence_number,omitempty"`
+	Timestamp      time.Time `json:"timestamp,omitempty"`
+	Type           string    `json:"type"`
+	Path           []string  `json:"path,omitempty"`
+	Value          any       `json:"value,omitempty"`
 }
 
 // SyncRequest is posted by the client sync agent.
 type SyncRequest struct {
 	ClientID          string            `json:"client_id"`
+	ManifestVersion   int               `json:"manifest_version,omitempty"`
 	ClientVectorClock map[string]uint64 `json:"client_vector_clock,omitempty"`
 	Ops               []Op              `json:"ops"`
 }
@@ -63,9 +66,10 @@ type Conflict struct {
 
 // ObjectResult is per-object sync response output.
 type ObjectResult struct {
-	ObjectID      string            `json:"object_id"`
-	State         map[string]any    `json:"state"`
-	VersionVector map[string]uint64 `json:"version_vector"`
+	ObjectID            string            `json:"object_id"`
+	State               map[string]any    `json:"state"`
+	VersionVector       map[string]uint64 `json:"version_vector"`
+	LastAppliedSequence uint64            `json:"last_applied_sequence"`
 }
 
 // SyncResponse is returned from /v1/sync.

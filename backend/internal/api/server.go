@@ -61,6 +61,7 @@ func NewServer(signer *security.Signer, st *store.MemoryStore, engine *syncer.En
 
 func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/healthz", s.handleHealth)
+	mux.HandleFunc("/.well-known/dwce-keys", s.withCORS(s.handleDWCEKeys))
 	mux.HandleFunc("/v1/manifest", s.withCORS(s.withAuth(s.handleManifest)))
 	mux.HandleFunc("/v1/sync", s.withCORS(s.withAuth(s.handleSync)))
 	mux.HandleFunc("/v1/sync/status", s.withCORS(s.withAuth(s.handleSyncStatus)))
@@ -69,6 +70,17 @@ func (s *Server) Register(mux *http.ServeMux) {
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleDWCEKeys(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Cache-Control", "public, max-age=300")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"keys": []security.PublicJWK{s.signer.PublicJWK()},
+	})
 }
 
 func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {

@@ -13,7 +13,7 @@ const manifestListEl = document.getElementById("manifest-list");
 const manifestVizEl = document.getElementById("manifest-viz");
 const workflowVizEl = document.getElementById("workflow-viz");
 
-init().catch((err) => appendLog(`Init error: ${err.message}`));
+init().catch((err) => appendLog(`Init issue: ${err.message}`));
 
 async function init() {
   updateNetworkLabel();
@@ -59,7 +59,7 @@ async function init() {
   document.getElementById("sync-now").addEventListener("click", runSync);
 
   await renderSnapshot();
-  appendLog("Ready.");
+  appendLog("Init done.");
 }
 
 function registerWorkflows() {
@@ -116,20 +116,20 @@ function registerDependencies() {
 
 async function prepareWorkflow() {
   const goal = document.getElementById("goal").value;
-  manifestStatusEl.textContent = `Preparing ${goal}...`;
+  manifestStatusEl.textContent = `Loading ${goal}...`;
 
   try {
     const prepared = await DWCE.prepareWorkflow(goal);
     if (!prepared.offline_allowed) {
-      manifestStatusEl.textContent = `Offline disabled for ${goal}. Intents can be stored and executed online.`;
+      manifestStatusEl.textContent = `${goal}: run blocked without network.`;
       manifestVizEl.style.display = "none";
       return;
     }
-    manifestStatusEl.textContent = `Manifest prepared (${prepared.closure.length} resources).`;
+    manifestStatusEl.textContent = `Manifest loaded (${prepared.closure.length} resources).`;
     renderManifestViz(prepared.manifest.resources);
   } catch (err) {
-    manifestStatusEl.textContent = `Error: ${err.message}`;
-    appendLog(`Prepare error: ${err.message}`);
+    manifestStatusEl.textContent = `Issue: ${err.message}`;
+    appendLog(`Prepare issue: ${err.message}`);
   }
 }
 
@@ -157,7 +157,7 @@ async function queueOperationFromForm() {
 }
 
 async function runSync() {
-  syncStatusEl.textContent = "Syncing...";
+  syncStatusEl.textContent = "Sync run...";
   try {
     const result = await DWCE.sync();
     if (result.status === "idle") {
@@ -171,7 +171,7 @@ async function runSync() {
       syncStatusEl.textContent = `Validated (${result.acked})`;
     }
   } catch (err) {
-    syncStatusEl.textContent = `Sync failed: ${err.message}`;
+    syncStatusEl.textContent = `Sync issue: ${err.message}`;
   }
 
   await renderSnapshot();
@@ -193,7 +193,7 @@ function appendLog(message) {
   entry.style.padding = "0.25rem 0";
   entry.style.borderBottom = "1px solid rgba(255,255,255,0.05)";
 
-  // Extract timestamp if present
+  // Use local time when message starts with an ISO timestamp.
   const parts = message.split(" ");
   if (parts[0].includes("T") && parts[0].includes("Z")) {
     const time = new Date(parts[0]).toLocaleTimeString();
@@ -252,13 +252,11 @@ function getFileIcon(ext) {
 }
 
 function highlightActiveStep(payload) {
-  // Logic to guess which step is "active" based on op type or simple progression
-  // In a real app, the workflow engine would track this.
-  // For the demo, we can just highlight based on objects modified.
+  // Mark one step based on current list state.
   const allSteps = Array.from(timelineEl.querySelectorAll(".step-card"));
   if (allSteps.length === 0) return;
 
-  // Highlight the first pending step as active for demo purposes
+  // Use the first pending step.
   const firstPending = allSteps.find(s => !s.classList.contains("completed"));
   if (firstPending) {
     allSteps.forEach(s => s.classList.remove("active"));

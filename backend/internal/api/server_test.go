@@ -77,6 +77,43 @@ func TestUnsafeManifestRejected(t *testing.T) {
 	}
 }
 
+func TestDWCEKeysEndpoint(t *testing.T) {
+	staticDir := makeStaticDir(t)
+	s := buildServer(t, staticDir)
+
+	mux := http.NewServeMux()
+	s.Register(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/dwce-keys", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	var body struct {
+		Keys []struct {
+			Kid string `json:"kid"`
+			Kty string `json:"kty"`
+			Crv string `json:"crv"`
+			X   string `json:"x"`
+		} `json:"keys"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal keys: %v", err)
+	}
+	if len(body.Keys) != 1 {
+		t.Fatalf("expected one key, got %d", len(body.Keys))
+	}
+	if body.Keys[0].Kid == "" || body.Keys[0].X == "" {
+		t.Fatalf("invalid key payload: %#v", body.Keys[0])
+	}
+	if body.Keys[0].Kty != "OKP" || body.Keys[0].Crv != "Ed25519" {
+		t.Fatalf("unexpected key type: %#v", body.Keys[0])
+	}
+}
+
 func TestAsyncSyncFlow(t *testing.T) {
 	staticDir := makeStaticDir(t)
 	s := buildServer(t, staticDir)

@@ -109,3 +109,82 @@ func TestEventualValidationFailure(t *testing.T) {
 		t.Fatalf("validation-failed op should not be acked")
 	}
 }
+
+func TestRejectOutOfOrderSequence(t *testing.T) {
+	st := store.NewMemoryStore()
+	engine := NewEngine(st)
+
+	first := core.SyncRequest{
+		ClientID: "device-seq",
+		Ops: []core.Op{
+			{
+				OpID:           "seq:2",
+				ObjectID:       "note:1",
+				ClientID:       "device-seq",
+				Clock:          2,
+				SequenceNumber: 2,
+				Type:           "set_field",
+				Path:           []string{"content"},
+				Value:          "newer",
+			},
+		},
+	}
+	firstResp := engine.Apply(first)
+	if len(firstResp.AckedOpIDs) != 1 {
+		t.Fatalf("expected first op to be acked, got %#v", firstResp)
+	}
+
+	second := core.SyncRequest{
+		ClientID: "device-seq",
+		Ops: []core.Op{
+			{
+				OpID:           "seq:1",
+				ObjectID:       "note:1",
+				ClientID:       "device-seq",
+				Clock:          1,
+				SequenceNumber: 1,
+				Type:           "set_field",
+				Path:           []string{"content"},
+				Value:          "older",
+			},
+		},
+	}
+	secondResp := engine.Apply(second)
+	if len(secondResp.Conflicts) != 1 {
+		t.Fatalf("expected one conflict, got %#v", secondResp)
+	}
+	if secondResp.Conflicts[0].Reason != "out_of_order_sequence" {
+		t.Fatalf("unexpected reason: %s", secondResp.Conflicts[0].Reason)
+	}
+}
+
+func TestDeduplicateOperationID(t *testing.T) {
+	st := store.NewMemoryStore()
+	engine := NewEngine(st)
+
+	req := core.SyncRequest{
+		ClientID: "device-dedupe",
+		Ops: []core.Op{
+			{
+				OpID:           "dedupe:1",
+				ObjectID:       "note:2",
+				ClientID:       "device-dedupe",
+				Clock:          1,
+				SequenceNumber: 1,
+				Type:           "set_field",
+				Path:           []string{"content"},
+				Value:          "hello",
+			},
+		},
+	}
+
+	first := engine.Apply(req)
+	second := engine.Apply(req)
+	if len(first.AckedOpIDs) != 1 || len(second.AckedOpIDs) != 1 {
+		t.Fatalf("expected duplicate op id to be deduped and acknowledged once per response")
+	}
+	obj := st.GetObject("note:2")
+	if obj.LastAppliedSequence != 1 {
+		t.Fatalf("expected last sequence to stay at 1, got %d", obj.LastAppliedSequence)
+	}
+}

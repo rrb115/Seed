@@ -90,10 +90,12 @@ On reconnect:
 
 ## 6) Go services
 
+- `GET /.well-known/dwce-keys`
+  - Publishes active Ed25519 verification keys (`kid`) as JWK.
 - `GET /v1/manifest`
   - Returns signed deterministic workflow closure manifest.
 - `POST /v1/sync`
-  - Idempotent operation apply.
+  - Idempotent operation apply with sequence monotonicity checks.
 - `GET /v1/sync/status`
   - Poll asynchronous queue completion.
 - `POST /v1/verify-resource`

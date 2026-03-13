@@ -9,8 +9,9 @@ import (
 
 // ObjectState is the canonical per-object state stored server-side.
 type ObjectState struct {
-	Data          map[string]any
-	VersionVector map[string]uint64
+	Data                map[string]any
+	VersionVector       map[string]uint64
+	LastAppliedSequence uint64
 }
 
 // MemoryStore is an in-memory storage backend for demo/reference use.
@@ -47,7 +48,7 @@ func (s *MemoryStore) GetObject(objectID string) ObjectState {
 	defer s.mu.RUnlock()
 	obj, ok := s.objects[objectID]
 	if !ok {
-		return ObjectState{Data: map[string]any{}, VersionVector: map[string]uint64{}}
+		return ObjectState{Data: map[string]any{}, VersionVector: map[string]uint64{}, LastAppliedSequence: 0}
 	}
 	return cloneObject(obj)
 }
@@ -88,7 +89,7 @@ func cloneObject(obj ObjectState) ObjectState {
 	for k, v := range obj.VersionVector {
 		vvCopy[k] = v
 	}
-	return ObjectState{Data: dataCopy, VersionVector: vvCopy}
+	return ObjectState{Data: dataCopy, VersionVector: vvCopy, LastAppliedSequence: obj.LastAppliedSequence}
 }
 
 func deepCopy(v any) any {

@@ -7,6 +7,16 @@ import (
 	"errors"
 )
 
+// PublicJWK is a minimal public key representation for clients.
+type PublicJWK struct {
+	Kty string `json:"kty"`
+	Crv string `json:"crv"`
+	Kid string `json:"kid"`
+	X   string `json:"x"`
+	Use string `json:"use,omitempty"`
+	Alg string `json:"alg,omitempty"`
+}
+
 // Signer handles Ed25519 signing for manifests.
 type Signer struct {
 	keyID string
@@ -44,6 +54,21 @@ func (s *Signer) KeyID() string {
 
 func (s *Signer) PublicKeyBase64() string {
 	return base64.StdEncoding.EncodeToString(s.pub)
+}
+
+func (s *Signer) PublicKeyBase64URL() string {
+	return base64.RawURLEncoding.EncodeToString(s.pub)
+}
+
+func (s *Signer) PublicJWK() PublicJWK {
+	return PublicJWK{
+		Kty: "OKP",
+		Crv: "Ed25519",
+		Kid: s.keyID,
+		X:   s.PublicKeyBase64URL(),
+		Use: "sig",
+		Alg: "EdDSA",
+	}
 }
 
 func (s *Signer) Sign(payload []byte) string {
